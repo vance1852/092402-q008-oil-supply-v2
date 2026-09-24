@@ -5,13 +5,30 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from datetime import timedelta
+from datetime import timedelta, timezone
 from decimal import Decimal
-from typing import Any, Iterable, Mapping
+from typing import Any, Mapping
 
 from .clock import SystemClock, parse_utc, utc_text
 from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
-from .models import IndexQuote, Facility, InventoryLot, NominationRequest, Route, SupplyScenario
+from .force_majeure import (
+    NominationBaseline,
+    conservation_ledger,
+    curtailment_targets,
+    service_dates_window,
+)
+from .models import (
+    ForceMajeureAppealRequest,
+    ForceMajeureDeclaration,
+    IndexQuote,
+    Facility,
+    InventoryLot,
+    NominationRequest,
+    Route,
+    SupplyScenario,
+    identifier,
+    required_text,
+)
 from .planning import (
     AllocationRequest,
     PricePoint,
@@ -30,11 +47,16 @@ from .planning import (
 from .storage import initialize, transaction
 
 
+ZERO_DEC = Decimal("0")
+HUNDRED_DEC = Decimal("100")
+
+
 ROLE_PERMISSIONS = {
     "planner": {"quote.write", "catalog.write", "scenario.write", "scenario.run"},
-    "dispatcher": {"nomination.write", "allocation.run", "transfer.write", "inventory.write"},
-    "risk": {"outage.write", "scenario.approve", "report.read"},
+    "dispatcher": {"nomination.write", "allocation.run", "transfer.write", "inventory.write", "report.read"},
+    "risk": {"outage.write", "forcemajeure.write", "forcemajeure.rule", "scenario.approve", "report.read"},
     "auditor": {"report.read", "audit.read"},
+    "shipper": {"appeal.write", "report.read"},
 }
 
 
@@ -295,7 +317,17 @@ class SupplyService:
             "SELECT * FROM inventory_lots WHERE facility_id=? AND product=? ORDER BY received_at,lot_id",
             (facility_id, product),
         ).fetchall()
-        return {"facility_id": facility_id, "product": product, **weighted_inventory_cost(rows)}
+        summary = {"facility_id": facility_id, "product": product, **weighted_inventory_cost(rows)}
+        reserved_row = self.connection.execute(
+            "SELECT COALESCE(SUM(CAST(barrels AS REAL)),0) AS reserved FROM nomination_reservations "
+            "WHERE facility_id=? AND product=?",
+            (facility_id, product),
+        ).fetchone()
+        reserved = quantize_volume(Decimal(str(reserved_row["reserved"])))
+        available = Decimal(summary["available_barrels"])
+        summary["reserved_barrels"] = decimal_text(reserved)
+        summary["unreserved_barrels"] = decimal_text(quantize_volume(available - reserved))
+        return summary
 
     def submit_nomination(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
         self._require(actor_id, "nomination.write")
@@ -354,6 +386,13 @@ class SupplyService:
             (route["route_id"], end, start),
         ).fetchall()
         percentages = [Decimal(row["capacity_percent"]) for row in rows]
+        fm_rows = self.connection.execute(
+            "SELECT v.capacity_percent FROM force_majeure_cases c "
+            "JOIN force_majeure_case_versions v ON v.case_id=c.case_id AND v.version=c.current_version "
+            "WHERE c.route_id=? AND c.state='active' AND v.impact_starts_at<=? AND v.impact_ends_at>=?",
+            (route["route_id"], end, start),
+        ).fetchall()
+        percentages.extend(Decimal(row["capacity_percent"]) for row in fm_rows)
         return effective_capacity(Decimal(route["daily_capacity"]), percentages)
 
     def allocate(self, actor_id: str, route_id: str, service_date: str) -> dict[str, Any]:
@@ -378,6 +417,12 @@ class SupplyService:
             for row in nominations
         ]
         available = self._capacity_for_date(route, service_date)
+        occupied_row = self.connection.execute(
+            "SELECT COALESCE(SUM(CAST(allocated_barrels AS REAL)),0) AS occupied FROM nominations "
+            "WHERE route_id=? AND service_date=? AND state IN ('allocated','curtailed','in_transit')",
+            (route_id, service_date),
+        ).fetchone()
+        available = quantize_volume(max(ZERO_DEC, available - Decimal(str(occupied_row["occupied"]))))
         input_value = [dict(row) for row in nominations]
         input_sha256 = digest({"route": dict(route), "nominations": input_value, "capacity": str(available)})
         result_rows = allocate_capacity(available, requests)
@@ -400,6 +445,12 @@ class SupplyService:
                     "WHERE nomination_id=? AND state='submitted'",
                     (item["allocated_barrels"], state, item["nomination_id"]),
                 )
+                if state == "allocated":
+                    self.connection.execute(
+                        "INSERT INTO nomination_reservations(nomination_id,facility_id,product,barrels) "
+                        "SELECT ?,r.origin_id,r.product,? FROM routes r WHERE r.route_id=?",
+                        (item["nomination_id"], item["allocated_barrels"], route_id),
+                    )
             allocation_id = int(cursor.lastrowid)
             self._audit("route", route_id, "allocation.completed", actor_id, {"allocation_id": allocation_id})
         return {"allocation_id": allocation_id, **result}
@@ -420,7 +471,7 @@ class SupplyService:
         ).fetchone()
         if nomination is None:
             raise NotFound("提名不存在")
-        if nomination["state"] != "allocated" or nomination["revision"] != expected_revision:
+        if nomination["state"] not in {"allocated", "curtailed"} or nomination["revision"] != expected_revision:
             raise InvalidState("提名不是当前可发运版本")
         lot = self.connection.execute("SELECT * FROM inventory_lots WHERE lot_id=?", (lot_id,)).fetchone()
         if lot is None:
@@ -431,12 +482,22 @@ class SupplyService:
             raise Conflict("库存批次与线路起点或油品不匹配")
         if available < allocated:
             raise Conflict("库存不足以完成分配")
+        reservation = self.connection.execute(
+            "SELECT barrels FROM nomination_reservations WHERE nomination_id=?",
+            (nomination_id,),
+        ).fetchone()
+        if reservation is None or Decimal(reservation["barrels"]) != allocated:
+            raise InvalidState("库存预留与当前分配不一致，不能发运")
         expected_delivery = delivered_after_loss(allocated, int(nomination["loss_basis_points"]))
         departed_at = self._now()
         with transaction(self.connection, immediate=True):
             self.connection.execute(
                 "UPDATE inventory_lots SET available_barrels=?,revision=revision+1 WHERE lot_id=? AND revision=?",
                 (decimal_text(quantize_volume(available - allocated)), lot_id, lot["revision"]),
+            )
+            self.connection.execute(
+                "DELETE FROM nomination_reservations WHERE nomination_id=? AND barrels=?",
+                (nomination_id, decimal_text(allocated)),
             )
             self.connection.execute(
                 "UPDATE nominations SET state='in_transit',revision=revision+1 WHERE nomination_id=? AND revision=?",
@@ -464,6 +525,782 @@ class SupplyService:
             "expected_delivered_barrels": decimal_text(expected_delivery),
             "expected_arrival": utc_text(parse_utc(departed_at) + timedelta(hours=int(nomination["transit_hours"]))),
         }
+
+    # ------------------------------------------------------------------
+    # 不可抗力案件：冻结版本、确定性削减、申诉与恢复
+    # ------------------------------------------------------------------
+
+    AFFECTED_STATES = ("allocated", "curtailed", "in_transit", "delivered")
+
+    def _case_row(self, case_id: str) -> sqlite3.Row:
+        row = self.connection.execute(
+            "SELECT * FROM force_majeure_cases WHERE case_id=?", (case_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("不可抗力案件不存在")
+        return row
+
+    def _latest_case_version(self, case_id: str) -> sqlite3.Row:
+        row = self.connection.execute(
+            "SELECT * FROM force_majeure_case_versions WHERE case_id=? ORDER BY version DESC LIMIT 1",
+            (case_id,),
+        ).fetchone()
+        if row is None:
+            raise InvalidState("案件还没有任何版本")
+        return row
+
+    def _case_baseline_rows(self, case_id: str) -> list[sqlite3.Row]:
+        return self.connection.execute(
+            "SELECT * FROM force_majeure_baselines WHERE case_id=? "
+            "ORDER BY service_date,contract_rank,nomination_id",
+            (case_id,),
+        ).fetchall()
+
+    @staticmethod
+    def _shipped_for(nomination_id: str, connection: sqlite3.Connection) -> Decimal:
+        row = connection.execute(
+            "SELECT loaded_barrels FROM transfers WHERE nomination_id=?",
+            (nomination_id,),
+        ).fetchone()
+        return ZERO_DEC if row is None else quantize_volume(Decimal(row["loaded_barrels"]))
+
+    def _freeze_entering_baselines(
+        self, case_id: str, route_id: str, window_dates: list[str], entered_version: int
+    ) -> int:
+        """把新进入影响窗口的已配额提名按当前配额冻结为基线，并刷新合同排序。"""
+        if not window_dates:
+            self._refresh_contract_ranks(case_id)
+            return 0
+        placeholders = ",".join("?" for _ in window_dates)
+        rows = self.connection.execute(
+            f"SELECT * FROM nominations WHERE route_id=? AND service_date IN ({placeholders}) "
+            f"AND state IN ({','.join('?' for _ in self.AFFECTED_STATES)}) "
+            "AND nomination_id NOT IN "
+            "(SELECT nomination_id FROM force_majeure_baselines WHERE case_id=?) "
+            "ORDER BY service_date,priority,submitted_at,nomination_id",
+            [route_id, *window_dates, *self.AFFECTED_STATES, case_id],
+        ).fetchall()
+        for row in rows:
+            self.connection.execute(
+                "INSERT INTO force_majeure_baselines(case_id,nomination_id,shipper_id,route_id,"
+                "service_date,priority,submitted_at,contract_rank,requested_barrels,"
+                "baseline_barrels,entered_version) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    case_id,
+                    row["nomination_id"],
+                    row["shipper_id"],
+                    route_id,
+                    row["service_date"],
+                    int(row["priority"]),
+                    row["submitted_at"],
+                    0,
+                    row["requested_barrels"],
+                    row["allocated_barrels"],
+                    entered_version,
+                ),
+            )
+        self._refresh_contract_ranks(case_id)
+        return len(rows)
+
+    def _refresh_contract_ranks(self, case_id: str) -> None:
+        rows = self.connection.execute(
+            "SELECT nomination_id,service_date FROM force_majeure_baselines WHERE case_id=?",
+            (case_id,),
+        ).fetchall()
+        by_date: dict[str, list[str]] = {}
+        for row in rows:
+            by_date.setdefault(row["service_date"], []).append(row["nomination_id"])
+        for service_date, nomination_ids in by_date.items():
+            peers = self.connection.execute(
+                "SELECT nomination_id FROM force_majeure_baselines WHERE case_id=? AND service_date=? "
+                "ORDER BY priority,submitted_at,nomination_id",
+                (case_id, service_date),
+            ).fetchall()
+            for rank, peer in enumerate(peers, start=1):
+                self.connection.execute(
+                    "UPDATE force_majeure_baselines SET contract_rank=? "
+                    "WHERE case_id=? AND nomination_id=?",
+                    (rank, case_id, peer["nomination_id"]),
+                )
+
+    def declare_force_majeure(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "forcemajeure.write")
+        declaration = ForceMajeureDeclaration.from_dict(raw)
+        self.route(declaration.route_id)
+        starts = utc_text(parse_utc(declaration.impact_starts_at))
+        ends = utc_text(parse_utc(declaration.impact_ends_at))
+        existing = self.connection.execute(
+            "SELECT current_version FROM force_majeure_cases WHERE case_id=?",
+            (declaration.case_id,),
+        ).fetchone()
+        if existing is not None:
+            first = self.connection.execute(
+                "SELECT * FROM force_majeure_case_versions WHERE case_id=? AND version=1",
+                (declaration.case_id,),
+            ).fetchone()
+            evidence_hash = hashlib.sha256(
+                canonical_json(dict(declaration.evidence)).encode("utf-8")
+            ).hexdigest()
+            same = (
+                first is not None
+                and first["impact_starts_at"] == starts
+                and first["impact_ends_at"] == ends
+                and Decimal(first["capacity_percent"]) == declaration.capacity_percent
+                and hashlib.sha256(first["evidence_json"].encode("utf-8")).hexdigest() == evidence_hash
+            )
+            if not same:
+                raise Conflict("案件编号已经存在且宣布内容不同")
+            return self._version_view(declaration.case_id, 1, replayed=True)
+        for row in self.connection.execute(
+            "SELECT c.case_id,v.impact_starts_at AS s,v.impact_ends_at AS e "
+            "FROM force_majeure_cases c "
+            "JOIN force_majeure_case_versions v ON v.case_id=c.case_id AND v.version=c.current_version "
+            "WHERE c.route_id=? AND c.state='active'",
+            (declaration.route_id,),
+        ).fetchall():
+            if starts <= row["e"] and ends >= row["s"]:
+                raise Conflict(f"线路已有生效案件 {row['case_id']} 与本次影响窗口重叠")
+        try:
+            with transaction(self.connection, immediate=True):
+                self.connection.execute(
+                    "INSERT INTO force_majeure_cases(case_id,route_id,title,state,current_version,"
+                    "appeal_deadline,created_by,created_at) VALUES(?,?,?,'active',0,?,?,?)",
+                    (declaration.case_id, declaration.route_id, declaration.title,
+                     utc_text(parse_utc(declaration.appeal_deadline)), actor_id, self._now()),
+                )
+                self._freeze_entering_baselines(
+                    declaration.case_id, declaration.route_id, service_dates_window(starts, ends), 1
+                )
+                result = self._apply_case_version(
+                    actor_id=actor_id,
+                    case_id=declaration.case_id,
+                    change_kind="declared",
+                    starts_at=starts,
+                    ends_at=ends,
+                    capacity_percent=declaration.capacity_percent,
+                    evidence=dict(declaration.evidence),
+                    reason="宣布不可抗力",
+                    idempotency_key=None,
+                    freeze_others=False,
+                    grants=None,
+                )
+                self._audit("force_majeure", declaration.case_id, "force_majeure.declared", actor_id,
+                            {"version": result["version"], "route_id": declaration.route_id})
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("案件编号已经存在") from exc
+        return result
+
+    def _apply_case_version(
+        self,
+        *,
+        actor_id: str,
+        case_id: str,
+        change_kind: str,
+        starts_at: str,
+        ends_at: str,
+        capacity_percent: Decimal,
+        evidence: Mapping[str, Any],
+        reason: str,
+        idempotency_key: str | None,
+        freeze_others: bool,
+        grants: Mapping[str, Decimal] | None,
+    ) -> dict[str, Any]:
+        case = self._case_row(case_id)
+        if idempotency_key is not None:
+            replay = self.connection.execute(
+                "SELECT version FROM force_majeure_case_versions WHERE case_id=? AND idempotency_key=?",
+                (case_id, idempotency_key),
+            ).fetchone()
+            if replay is not None:
+                return self._version_view(case_id, int(replay["version"]), replayed=True)
+        route = self.connection.execute(
+            "SELECT * FROM routes WHERE route_id=?", (case["route_id"],)
+        ).fetchone()
+        nominal_capacity = Decimal(route["daily_capacity"])
+        window = service_dates_window(starts_at, ends_at)
+        next_version = int(case["current_version"]) + 1
+        self._freeze_entering_baselines(case_id, case["route_id"], window, next_version)
+        baseline_rows = self._case_baseline_rows(case_id)
+        baselines = [
+            NominationBaseline(
+                nomination_id=row["nomination_id"],
+                shipper_id=row["shipper_id"],
+                service_date=row["service_date"],
+                priority=int(row["priority"]),
+                submitted_at=row["submitted_at"],
+                baseline_barrels=Decimal(row["baseline_barrels"]),
+                shipped_barrels=self._shipped_for(row["nomination_id"], self.connection),
+            )
+            for row in baseline_rows
+        ]
+        window_dates = set(window)
+        window_rows = [row for row in baselines if row.service_date in window_dates]
+
+        opening: dict[str, Decimal] = {}
+        states_before: dict[str, str] = {}
+        for row in baseline_rows:
+            nom = self.connection.execute(
+                "SELECT allocated_barrels,state FROM nominations WHERE nomination_id=?",
+                (row["nomination_id"],),
+            ).fetchone()
+            opening[row["nomination_id"]] = Decimal(nom["allocated_barrels"])
+            states_before[row["nomination_id"]] = nom["state"]
+
+        if freeze_others:
+            # 申诉裁决：其他已经生效的份额逐字冻结，只有申诉方可以恢复。
+            targets = {nomination_id: value for nomination_id, value in opening.items()}
+        else:
+            targets = curtailment_targets(
+                nominal_capacity=nominal_capacity,
+                capacity_percent=capacity_percent,
+                rows=window_rows,
+            )
+        # 离开当前窗口的提名恢复到宣布时冻结的基线。
+        for row in baselines:
+            if row.service_date not in window_dates:
+                targets[row.nomination_id] = row.baseline_barrels
+
+        cap = effective_capacity(nominal_capacity, [capacity_percent])
+        grant_log: list[dict[str, Any]] = []
+        if grants:
+            for shipper_id, requested in grants.items():
+                remaining_grant = quantize_volume(max(ZERO_DEC, requested))
+                for row in sorted(
+                    (item for item in window_rows if item.shipper_id == shipper_id),
+                    key=lambda item: item.contract_key,
+                ):
+                    if remaining_grant <= ZERO_DEC:
+                        break
+                    used = sum(
+                        (targets.get(item.nomination_id, ZERO_DEC) for item in window_rows
+                         if item.service_date == row.service_date),
+                        ZERO_DEC,
+                    )
+                    headroom = quantize_volume(cap - used)
+                    current = targets.get(row.nomination_id, opening.get(row.nomination_id, ZERO_DEC))
+                    ceiling = quantize_volume(row.baseline_barrels - row.shipped_barrels) + row.shipped_barrels
+                    added = quantize_volume(
+                        min(remaining_grant, max(ZERO_DEC, headroom), max(ZERO_DEC, ceiling - current))
+                    )
+                    if added > ZERO_DEC:
+                        targets[row.nomination_id] = quantize_volume(current + added)
+                        remaining_grant = quantize_volume(remaining_grant - added)
+                        grant_log.append({
+                            "shipper_id": shipper_id,
+                            "nomination_id": row.nomination_id,
+                            "restored_barrels": decimal_text(added),
+                        })
+
+        shipped_map = {
+            row.nomination_id: row.shipped_barrels for row in baselines
+        }
+        reservations_before: dict[str, Decimal] = {}
+        for row in baseline_rows:
+            held = self.connection.execute(
+                "SELECT barrels FROM nomination_reservations WHERE nomination_id=?",
+                (row["nomination_id"],),
+            ).fetchone()
+            reservations_before[row["nomination_id"]] = ZERO_DEC if held is None else Decimal(held["barrels"])
+        baseline_map = {row["nomination_id"]: Decimal(row["baseline_barrels"]) for row in baseline_rows}
+        targets = {key: quantize_volume(value) for key, value in targets.items()}
+        ledger = conservation_ledger(
+            opening=opening,
+            targets=targets,
+            baseline=baseline_map,
+            shipped=shipped_map,
+            reservation_before=reservations_before,
+        )
+        evidence_json = canonical_json(evidence)
+        input_payload = {
+            "case_id": case_id,
+            "change_kind": change_kind,
+            "window": [starts_at, ends_at],
+            "capacity_percent": decimal_text(capacity_percent),
+            "evidence_sha256": hashlib.sha256(evidence_json.encode("utf-8")).hexdigest(),
+            "freeze_others": freeze_others,
+            "opening": {key: decimal_text(value) for key, value in sorted(opening.items())},
+            "shipped": {key: decimal_text(value) for key, value in sorted(shipped_map.items())},
+            "baselines": [
+                {"nomination_id": row["nomination_id"], "baseline": row["baseline_barrels"],
+                 "rank": row["contract_rank"], "entered_version": row["entered_version"]}
+                for row in baseline_rows
+            ],
+            "grants": grant_log,
+        }
+        input_sha256 = digest(input_payload)
+        self.connection.execute(
+            "INSERT INTO force_majeure_case_versions(case_id,version,change_kind,impact_starts_at,"
+            "impact_ends_at,capacity_percent,evidence_json,input_sha256,idempotency_key,"
+            "conservation_json,reason,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (case_id, next_version, change_kind, starts_at, ends_at, decimal_text(capacity_percent),
+             evidence_json, input_sha256, idempotency_key, canonical_json(ledger), reason,
+             actor_id, self._now()),
+        )
+        for base in baseline_rows:
+            nomination_id = base["nomination_id"]
+            before = opening[nomination_id]
+            after = targets[nomination_id]
+            shipped = shipped_map[nomination_id]
+            released = quantize_volume(max(ZERO_DEC, before - after))
+            restored = quantize_volume(max(ZERO_DEC, after - before))
+            self.connection.execute(
+                "INSERT INTO force_majeure_curtailments(case_id,version,nomination_id,shipper_id,"
+                "route_id,service_date,contract_rank,state_before,requested_barrels,allocated_before,"
+                "allocated_after,curtail_barrels,restored_barrels,in_transit_barrels) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (case_id, next_version, nomination_id, base["shipper_id"], case["route_id"],
+                 base["service_date"], base["contract_rank"], states_before[nomination_id],
+                 base["requested_barrels"], decimal_text(before), decimal_text(after),
+                 decimal_text(released), decimal_text(restored), decimal_text(shipped)),
+            )
+            held_before = reservations_before[nomination_id]
+            held_after = quantize_volume(after - shipped)
+            self.connection.execute(
+                "INSERT INTO force_majeure_reservation_moves(case_id,version,nomination_id,"
+                "reservation_before,reservation_after,released_barrels,restored_barrels) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (case_id, next_version, nomination_id, decimal_text(held_before),
+                 decimal_text(held_after),
+                 decimal_text(quantize_volume(max(ZERO_DEC, held_before - held_after))),
+                 decimal_text(quantize_volume(max(ZERO_DEC, held_after - held_before)))),
+            )
+            self._apply_nomination_version(base, after, shipped, states_before[nomination_id])
+        self.connection.execute(
+            "UPDATE force_majeure_cases SET current_version=? WHERE case_id=?",
+            (next_version, case_id),
+        )
+        self._audit("force_majeure", case_id, f"force_majeure.{change_kind}", actor_id,
+                    {"version": next_version, "conservation": ledger["allocation"]})
+        return self._version_view(case_id, next_version, replayed=False)
+
+    def _apply_nomination_version(
+        self, base: sqlite3.Row, after: Decimal, shipped: Decimal, previous_state: str
+    ) -> None:
+        if shipped > ZERO_DEC:
+            # 已在途或交付：状态与在途数量保持不变，只调整剩余预留。
+            new_state = previous_state
+        elif after >= Decimal(base["baseline_barrels"]):
+            new_state = "allocated"
+        else:
+            new_state = "curtailed"
+        held_after = quantize_volume(after - shipped)
+        self.connection.execute(
+            "UPDATE nominations SET allocated_barrels=?,state=?,revision=revision+1 WHERE nomination_id=?",
+            (decimal_text(after), new_state, base["nomination_id"]),
+        )
+        if held_after <= ZERO_DEC:
+            self.connection.execute(
+                "DELETE FROM nomination_reservations WHERE nomination_id=?", (base["nomination_id"],)
+            )
+        else:
+            self.connection.execute(
+                "INSERT INTO nomination_reservations(nomination_id,facility_id,product,barrels) "
+                "VALUES(?,(SELECT origin_id FROM routes WHERE route_id=?),"
+                "(SELECT product FROM routes WHERE route_id=?),?) "
+                "ON CONFLICT(nomination_id) DO UPDATE SET barrels=excluded.barrels",
+                (base["nomination_id"], base["route_id"], base["route_id"], decimal_text(held_after)),
+            )
+
+    def _version_view(self, case_id: str, version: int, *, replayed: bool) -> dict[str, Any]:
+        version_row = self.connection.execute(
+            "SELECT * FROM force_majeure_case_versions WHERE case_id=? AND version=?",
+            (case_id, version),
+        ).fetchone()
+        curtailments = self.connection.execute(
+            "SELECT nomination_id,shipper_id,service_date,contract_rank,state_before,"
+            "allocated_before,allocated_after,curtail_barrels,restored_barrels,in_transit_barrels "
+            "FROM force_majeure_curtailments WHERE case_id=? AND version=? "
+            "ORDER BY service_date,contract_rank,nomination_id",
+            (case_id, version),
+        ).fetchall()
+        return {
+            "case_id": case_id,
+            "version": version,
+            "change_kind": version_row["change_kind"],
+            "impact_starts_at": version_row["impact_starts_at"],
+            "impact_ends_at": version_row["impact_ends_at"],
+            "capacity_percent": version_row["capacity_percent"],
+            "state": self._case_row(case_id)["state"],
+            "input_sha256": version_row["input_sha256"],
+            "conservation": json.loads(version_row["conservation_json"]),
+            "curtailments": [dict(row) for row in curtailments],
+            "replayed": replayed,
+        }
+
+    def _require_active_case(self, case_id: str) -> sqlite3.Row:
+        case = self._case_row(case_id)
+        if case["state"] != "active":
+            raise InvalidState("案件已经结束或撤销，不能再产生版本")
+        return case
+
+    def _replay_version_if_seen(self, case_id: str, idempotency_key: str) -> dict[str, Any] | None:
+        """同一版本幂等键重复处理时，直接返回已经落库的版本，不再释放任何数量。"""
+        row = self.connection.execute(
+            "SELECT version FROM force_majeure_case_versions WHERE case_id=? AND idempotency_key=?",
+            (case_id, idempotency_key),
+        ).fetchone()
+        return None if row is None else self._version_view(case_id, int(row["version"]), replayed=True)
+
+    @staticmethod
+    def _validate_percentage(value: object) -> Decimal:
+        percentage = Decimal(str(value))
+        if not ZERO_DEC <= percentage <= HUNDRED_DEC:
+            raise ValidationFailed("capacity_percent 必须在 0 到 100 之间")
+        return percentage
+
+    def extend_force_majeure(
+        self,
+        actor_id: str,
+        case_id: str,
+        impact_ends_at: str,
+        capacity_percent: object,
+        evidence: Mapping[str, Any],
+        reason: str,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        self._require(actor_id, "forcemajeure.write")
+        key = identifier(idempotency_key, "idempotency_key")
+        replay = self._replay_version_if_seen(case_id, key)
+        if replay is not None:
+            return replay
+        self._require_active_case(case_id)
+        latest = self._latest_case_version(case_id)
+        new_end = utc_text(parse_utc(impact_ends_at, "impact_ends_at"))
+        if new_end <= latest["impact_ends_at"]:
+            raise ValidationFailed("延长后的结束时间必须晚于当前版本结束时间")
+        percentage = self._validate_percentage(capacity_percent)
+        if not isinstance(evidence, Mapping) or not evidence:
+            raise ValidationFailed("evidence 必须是非空证据对象")
+        with transaction(self.connection, immediate=True):
+            return self._apply_case_version(
+                actor_id=actor_id,
+                case_id=case_id,
+                change_kind="extended",
+                starts_at=latest["impact_starts_at"],
+                ends_at=new_end,
+                capacity_percent=percentage,
+                evidence=dict(evidence),
+                reason=required_text(reason, "reason"),
+                idempotency_key=key,
+                freeze_others=False,
+                grants=None,
+            )
+
+    def cancel_force_majeure(
+        self, actor_id: str, case_id: str, reason: str, idempotency_key: str
+    ) -> dict[str, Any]:
+        self._require(actor_id, "forcemajeure.write")
+        key = identifier(idempotency_key, "idempotency_key")
+        replay = self._replay_version_if_seen(case_id, key)
+        if replay is not None:
+            replay["state"] = "cancelled"
+            return replay
+        self._require_active_case(case_id)
+        latest = self._latest_case_version(case_id)
+        with transaction(self.connection, immediate=True):
+            result = self._apply_case_version(
+                actor_id=actor_id,
+                case_id=case_id,
+                change_kind="cancelled",
+                starts_at=latest["impact_starts_at"],
+                ends_at=latest["impact_ends_at"],
+                capacity_percent=HUNDRED_DEC,
+                evidence={"cancelled_at": self._now()},
+                reason=required_text(reason, "reason"),
+                idempotency_key=key,
+                freeze_others=False,
+                grants=None,
+            )
+            self.connection.execute(
+                "UPDATE force_majeure_cases SET state='cancelled' WHERE case_id=?", (case_id,)
+            )
+            result["state"] = "cancelled"
+        return result
+
+    def end_force_majeure(
+        self, actor_id: str, case_id: str, ended_at: str, reason: str, idempotency_key: str
+    ) -> dict[str, Any]:
+        self._require(actor_id, "forcemajeure.write")
+        key = identifier(idempotency_key, "idempotency_key")
+        replay = self._replay_version_if_seen(case_id, key)
+        if replay is not None:
+            replay["state"] = "ended"
+            return replay
+        self._require_active_case(case_id)
+        latest = self._latest_case_version(case_id)
+        end_text = utc_text(parse_utc(ended_at, "ended_at"))
+        if not latest["impact_starts_at"] < end_text < latest["impact_ends_at"]:
+            raise ValidationFailed("提前结束时间必须位于当前影响窗口内部")
+        with transaction(self.connection, immediate=True):
+            result = self._apply_case_version(
+                actor_id=actor_id,
+                case_id=case_id,
+                change_kind="ended",
+                starts_at=latest["impact_starts_at"],
+                ends_at=end_text,
+                capacity_percent=HUNDRED_DEC,
+                evidence={"ended_at": end_text},
+                reason=required_text(reason, "reason"),
+                idempotency_key=key,
+                freeze_others=False,
+                grants=None,
+            )
+            self.connection.execute(
+                "UPDATE force_majeure_cases SET state='ended' WHERE case_id=?", (case_id,)
+            )
+            result["state"] = "ended"
+        return result
+
+    def submit_appeal(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "appeal.write")
+        appeal = ForceMajeureAppealRequest.from_dict(raw)
+        if appeal.shipper_id != actor_id:
+            raise Forbidden("只能为自己的托运方编号提交申诉")
+        case = self._case_row(appeal.case_id)
+        if case["state"] != "active":
+            raise InvalidState("案件已经结束，不能再申诉")
+        deadline = parse_utc(case["appeal_deadline"])
+        if self.clock.now().astimezone(timezone.utc) > deadline:
+            raise InvalidState("申诉截止时间已过")
+        owns = self.connection.execute(
+            "SELECT 1 FROM force_majeure_baselines WHERE case_id=? AND shipper_id=? LIMIT 1",
+            (appeal.case_id, appeal.shipper_id),
+        ).fetchone()
+        if owns is None:
+            raise NotFound("该托运方在案件中没有受影响配额")
+        request_digest = digest(raw)
+        stored = self.connection.execute(
+            "SELECT request_sha256 FROM force_majeure_appeals WHERE idempotency_key=?",
+            (appeal.idempotency_key,),
+        ).fetchone()
+        if stored is not None:
+            if stored["request_sha256"] != request_digest:
+                raise Conflict("幂等键对应不同申诉内容")
+            row = self.connection.execute(
+                "SELECT * FROM force_majeure_appeals WHERE idempotency_key=?",
+                (appeal.idempotency_key,),
+            ).fetchone()
+            return self._appeal_view(row)
+        existing = self.connection.execute(
+            "SELECT appeal_id FROM force_majeure_appeals WHERE case_id=? AND shipper_id=?",
+            (appeal.case_id, appeal.shipper_id),
+        ).fetchone()
+        if existing is not None:
+            raise Conflict("每家托运方在截止前只能申诉一次")
+        try:
+            with transaction(self.connection, immediate=True):
+                self.connection.execute(
+                    "INSERT INTO force_majeure_appeals(appeal_id,case_id,shipper_id,reason,state,"
+                    "submitted_version,requested_adjustment_barrels,idempotency_key,request_sha256,"
+                    "submitted_by,submitted_at) VALUES(?,?,?,?,'submitted',?,?,?,?,?,?)",
+                    (appeal.appeal_id, appeal.case_id, appeal.shipper_id, appeal.reason,
+                     int(case["current_version"]), decimal_text(appeal.requested_barrels),
+                     appeal.idempotency_key, request_digest, actor_id, self._now()),
+                )
+                self._audit("force_majeure", appeal.case_id, "appeal.submitted", actor_id,
+                            {"appeal_id": appeal.appeal_id, "shipper_id": appeal.shipper_id})
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("申诉编号或幂等键冲突，或该托运方已经申诉过") from exc
+        row = self.connection.execute(
+            "SELECT * FROM force_majeure_appeals WHERE appeal_id=?", (appeal.appeal_id,)
+        ).fetchone()
+        return self._appeal_view(row)
+
+    def rule_appeal(
+        self,
+        actor_id: str,
+        appeal_id: str,
+        granted: bool,
+        granted_barrels: object,
+        idempotency_key: str,
+        capacity_percent: object | None = None,
+    ) -> dict[str, Any]:
+        self._require(actor_id, "forcemajeure.rule")
+        appeal_row = self.connection.execute(
+            "SELECT * FROM force_majeure_appeals WHERE appeal_id=?", (appeal_id,)
+        ).fetchone()
+        if appeal_row is None:
+            raise NotFound("申诉不存在")
+        key = identifier(idempotency_key, "idempotency_key")
+        replay = self.connection.execute(
+            "SELECT version FROM force_majeure_case_versions "
+            "WHERE case_id=? AND change_kind='appeal_ruling' AND idempotency_key=?",
+            (appeal_row["case_id"], key),
+        ).fetchone()
+        if replay is not None:
+            row = self.connection.execute(
+                "SELECT * FROM force_majeure_appeals WHERE appeal_id=?", (appeal_id,)
+            ).fetchone()
+            return {"appeal": self._appeal_view(row),
+                    "version": self._version_view(appeal_row["case_id"], int(replay["version"]), replayed=True)}
+        if appeal_row["state"] != "submitted":
+            raise InvalidState("申诉已经裁决")
+        case = self._require_active_case(appeal_row["case_id"])
+        latest = self._latest_case_version(case["case_id"])
+        percentage = Decimal(latest["capacity_percent"])
+        if capacity_percent is not None:
+            new_percentage = self._validate_percentage(capacity_percent)
+            if new_percentage < percentage:
+                raise ValidationFailed("裁决只能维持或上调容量上限，不能借裁决削减他人")
+            percentage = new_percentage
+        granted_amount = ZERO_DEC
+        if granted:
+            granted_amount = quantize_volume(Decimal(str(granted_barrels)))
+            if granted_amount <= ZERO_DEC:
+                raise ValidationFailed("同意申诉时 granted_barrels 必须为正数")
+        with transaction(self.connection, immediate=True):
+            result = self._apply_case_version(
+                actor_id=actor_id,
+                case_id=case["case_id"],
+                change_kind="appeal_ruling",
+                starts_at=latest["impact_starts_at"],
+                ends_at=latest["impact_ends_at"],
+                capacity_percent=percentage,
+                evidence={"appeal_id": appeal_id, "granted": granted,
+                          "granted_barrels": decimal_text(granted_amount)},
+                reason=f"申诉 {appeal_id} 裁决",
+                idempotency_key=key,
+                freeze_others=True,
+                grants={appeal_row["shipper_id"]: granted_amount} if granted else None,
+            )
+            actual_grant = quantize_volume(sum(
+                (Decimal(row["restored_barrels"]) for row in result["curtailments"]
+                 if row["shipper_id"] == appeal_row["shipper_id"]),
+                ZERO_DEC,
+            ))
+            others_changed = any(
+                Decimal(row["curtail_barrels"]) > ZERO_DEC or
+                (Decimal(row["allocated_after"]) != Decimal(row["allocated_before"])
+                 and row["shipper_id"] != appeal_row["shipper_id"])
+                for row in result["curtailments"]
+            )
+            if others_changed:
+                raise InvalidState("裁决不得改变其他托运方已经生效的份额")
+            if granted and actual_grant < granted_amount:
+                raise InvalidState("容量余量不足以恢复申请数量，请随裁决上调容量上限")
+            self.connection.execute(
+                "UPDATE force_majeure_appeals SET state=?,granted_barrels=?,ruled_version=?,"
+                "ruled_by=?,ruled_at=? WHERE appeal_id=?",
+                ("granted" if granted else "denied", decimal_text(actual_grant),
+                 result["version"], actor_id, self._now(), appeal_id),
+            )
+            self._audit("force_majeure", case["case_id"], "appeal.ruled", actor_id,
+                        {"appeal_id": appeal_id, "granted": decimal_text(actual_grant)})
+        row = self.connection.execute(
+            "SELECT * FROM force_majeure_appeals WHERE appeal_id=?", (appeal_id,)
+        ).fetchone()
+        return {"appeal": self._appeal_view(row), "version": result}
+
+    def _appeal_view(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "appeal_id": row["appeal_id"],
+            "case_id": row["case_id"],
+            "shipper_id": row["shipper_id"],
+            "state": row["state"],
+            "submitted_version": row["submitted_version"],
+            "ruled_version": row["ruled_version"],
+            "requested_adjustment_barrels": row["requested_adjustment_barrels"],
+            "granted_barrels": row["granted_barrels"],
+            "reason": row["reason"],
+        }
+
+    def force_majeure_case(self, actor_id: str, case_id: str) -> dict[str, Any]:
+        self._require(actor_id, "report.read")
+        case = self._case_row(case_id)
+        versions = self.connection.execute(
+            "SELECT version,change_kind,impact_starts_at,impact_ends_at,capacity_percent,"
+            "input_sha256,evidence_json,conservation_json,reason,created_by,created_at,idempotency_key "
+            "FROM force_majeure_case_versions WHERE case_id=? ORDER BY version",
+            (case_id,),
+        ).fetchall()
+        appeals = self.connection.execute(
+            "SELECT * FROM force_majeure_appeals WHERE case_id=? ORDER BY submitted_at,appeal_id",
+            (case_id,),
+        ).fetchall()
+        return {
+            "case_id": case_id,
+            "route_id": case["route_id"],
+            "title": case["title"],
+            "state": case["state"],
+            "current_version": case["current_version"],
+            "appeal_deadline": case["appeal_deadline"],
+            "versions": [
+                {
+                    **{key: row[key] for key in row.keys() if key != "conservation_json"},
+                    "conservation": json.loads(row["conservation_json"]),
+                }
+                for row in versions
+            ],
+            "appeals": [self._appeal_view(row) for row in appeals],
+        }
+
+    def nomination_force_majeure_trace(self, actor_id: str, nomination_id: str) -> dict[str, Any]:
+        """托运方视角：从一条提名直达案件、合同排序、申诉和恢复记录。"""
+        actor = self._require(actor_id, "report.read")
+        nomination = self.connection.execute(
+            "SELECT * FROM nominations WHERE nomination_id=?", (nomination_id,)
+        ).fetchone()
+        if nomination is None:
+            raise NotFound("提名不存在")
+        if actor["role"] == "shipper" and nomination["shipper_id"] != actor_id:
+            raise Forbidden("只能查看自己托运方的提名")
+        case_rows = self.connection.execute(
+            "SELECT DISTINCT case_id FROM force_majeure_baselines WHERE nomination_id=? ORDER BY case_id",
+            (nomination_id,),
+        ).fetchall()
+        cases = []
+        for item in case_rows:
+            case_id = item["case_id"]
+            versions = self.connection.execute(
+                "SELECT v.version,v.change_kind,v.impact_starts_at,v.impact_ends_at,v.capacity_percent,"
+                "v.conservation_json,c.state_before,c.allocated_before,c.allocated_after,"
+                "c.curtail_barrels,c.restored_barrels,c.in_transit_barrels,"
+                "b.contract_rank,b.entered_version "
+                "FROM force_majeure_case_versions v "
+                "JOIN force_majeure_curtailments c ON c.case_id=v.case_id AND c.version=v.version "
+                "JOIN force_majeure_baselines b ON b.case_id=c.case_id AND b.nomination_id=c.nomination_id "
+                "WHERE c.nomination_id=? AND v.case_id=? ORDER BY v.version",
+                (nomination_id, case_id),
+            ).fetchall()
+            appeal = self.connection.execute(
+                "SELECT * FROM force_majeure_appeals WHERE case_id=? AND shipper_id=?",
+                (case_id, nomination["shipper_id"]),
+            ).fetchone()
+            cases.append({
+                "case_id": case_id,
+                "state": self._case_row(case_id)["state"],
+                "contract_rank": versions[0]["contract_rank"] if versions else None,
+                "entered_version": versions[0]["entered_version"] if versions else None,
+                "versions": [
+                    {
+                        "version": row["version"],
+                        "change_kind": row["change_kind"],
+                        "impact_window": [row["impact_starts_at"], row["impact_ends_at"]],
+                        "capacity_percent": row["capacity_percent"],
+                        "state_before": row["state_before"],
+                        "allocated_before": row["allocated_before"],
+                        "allocated_after": row["allocated_after"],
+                        "curtail_barrels": row["curtail_barrels"],
+                        "restored_barrels": row["restored_barrels"],
+                        "in_transit_barrels": row["in_transit_barrels"],
+                        "case_conservation": json.loads(row["conservation_json"]),
+                    }
+                    for row in versions
+                ],
+                "appeal": None if appeal is None else self._appeal_view(appeal),
+            })
+        return {
+            "nomination_id": nomination_id,
+            "shipper_id": nomination["shipper_id"],
+            "route_id": nomination["route_id"],
+            "service_date": nomination["service_date"],
+            "requested_barrels": nomination["requested_barrels"],
+            "allocated_barrels": nomination["allocated_barrels"],
+            "state": nomination["state"],
+            "revision": nomination["revision"],
+            "force_majeure_cases": cases,
+        }
+
 
     def create_scenario(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
         self._require(actor_id, "scenario.write")

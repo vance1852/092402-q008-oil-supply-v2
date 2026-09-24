@@ -260,3 +260,70 @@ class SupplyScenario:
             route_capacity_changes=parsed_routes,
             demand_changes=parsed_demand,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class ForceMajeureDeclaration:
+    case_id: str
+    route_id: str
+    title: str
+    impact_starts_at: str
+    impact_ends_at: str
+    capacity_percent: Decimal
+    evidence: Mapping[str, Any]
+    appeal_deadline: str
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "ForceMajeureDeclaration":
+        impact_starts_at = required_text(raw.get("impact_starts_at"), "impact_starts_at", 40)
+        impact_ends_at = required_text(raw.get("impact_ends_at"), "impact_ends_at", 40)
+        appeal_deadline = required_text(raw.get("appeal_deadline"), "appeal_deadline", 40)
+        try:
+            start = parse_utc(impact_starts_at, "impact_starts_at")
+            end = parse_utc(impact_ends_at, "impact_ends_at")
+            parse_utc(appeal_deadline, "appeal_deadline")
+        except ValueError as exc:
+            raise ValidationFailed(str(exc)) from exc
+        if end <= start:
+            raise ValidationFailed("impact_ends_at 必须晚于 impact_starts_at")
+        evidence = raw.get("evidence")
+        if not isinstance(evidence, Mapping) or not evidence:
+            raise ValidationFailed("evidence 必须是非空证据对象")
+        return cls(
+            case_id=identifier(raw.get("case_id"), "case_id"),
+            route_id=identifier(raw.get("route_id"), "route_id"),
+            title=required_text(raw.get("title"), "title"),
+            impact_starts_at=impact_starts_at,
+            impact_ends_at=impact_ends_at,
+            capacity_percent=decimal_value(
+                raw.get("capacity_percent"),
+                "capacity_percent",
+                minimum=Decimal("0"),
+                maximum=Decimal("100"),
+            ),
+            evidence=evidence,
+            appeal_deadline=appeal_deadline,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ForceMajeureAppealRequest:
+    appeal_id: str
+    case_id: str
+    shipper_id: str
+    requested_barrels: Decimal
+    reason: str
+    idempotency_key: str
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "ForceMajeureAppealRequest":
+        return cls(
+            appeal_id=identifier(raw.get("appeal_id"), "appeal_id"),
+            case_id=identifier(raw.get("case_id"), "case_id"),
+            shipper_id=identifier(raw.get("shipper_id"), "shipper_id"),
+            requested_barrels=decimal_value(
+                raw.get("requested_barrels"), "requested_barrels", minimum=Decimal("0.001")
+            ),
+            reason=required_text(raw.get("reason"), "reason", maximum=1024),
+            idempotency_key=identifier(raw.get("idempotency_key"), "idempotency_key"),
+        )

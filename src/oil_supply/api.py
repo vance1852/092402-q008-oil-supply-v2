@@ -73,6 +73,28 @@ class JsonApplication:
                 return Response(200, self.service.inventory_summary(query.get("facility_id", [""])[0], query.get("product", [""])[0]))
             if method == "POST" and path == "/nominations":
                 return Response(201, self.service.submit_nomination(actor, payload))
+            if method == "POST" and path == "/force-majeure":
+                return Response(201, self.service.declare_force_majeure(actor, payload))
+            if method == "GET" and len(parts) == 2 and parts[0] == "force-majeure":
+                return Response(200, self.service.force_majeure_case(actor, parts[1]))
+            if method == "POST" and len(parts) == 3 and parts[0] == "force-majeure" and parts[2] == "extend":
+                return Response(200, self.service.extend_force_majeure(
+                    actor, parts[1], payload["impact_ends_at"], payload["capacity_percent"],
+                    payload.get("evidence", {}), payload["reason"], payload["idempotency_key"]))
+            if method == "POST" and len(parts) == 3 and parts[0] == "force-majeure" and parts[2] == "cancel":
+                return Response(200, self.service.cancel_force_majeure(
+                    actor, parts[1], payload["reason"], payload["idempotency_key"]))
+            if method == "POST" and len(parts) == 3 and parts[0] == "force-majeure" and parts[2] == "end":
+                return Response(200, self.service.end_force_majeure(
+                    actor, parts[1], payload["ended_at"], payload["reason"], payload["idempotency_key"]))
+            if method == "POST" and path == "/appeals":
+                return Response(201, self.service.submit_appeal(actor, payload))
+            if method == "POST" and len(parts) == 3 and parts[0] == "appeals" and parts[2] == "rule":
+                return Response(200, self.service.rule_appeal(
+                    actor, parts[1], bool(payload["granted"]), payload.get("granted_barrels", "0"),
+                    payload["idempotency_key"], payload.get("capacity_percent")))
+            if method == "GET" and len(parts) == 3 and parts[0] == "nominations" and parts[2] == "force-majeure":
+                return Response(200, self.service.nomination_force_majeure_trace(actor, parts[1]))
             if method == "POST" and len(parts) == 3 and parts[0] == "routes" and parts[2] == "allocate":
                 return Response(200, self.service.allocate(actor, parts[1], payload["service_date"]))
             if method == "POST" and path == "/transfers":
