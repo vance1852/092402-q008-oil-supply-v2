@@ -171,6 +171,94 @@ CREATE TABLE IF NOT EXISTS scenario_runs (
     UNIQUE(scenario_id, as_of_date, input_sha256)
 );
 
+CREATE TABLE IF NOT EXISTS inventory_reservations (
+    reservation_id TEXT PRIMARY KEY,
+    lot_id TEXT NOT NULL REFERENCES inventory_lots(lot_id),
+    nomination_id TEXT NOT NULL REFERENCES nominations(nomination_id),
+    quantity_barrels TEXT NOT NULL,
+    held_barrels TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'held' CHECK(state IN ('held','consumed','released')),
+    revision INTEGER NOT NULL DEFAULT 1,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_reservations_nomination
+ON inventory_reservations(nomination_id, state);
+
+CREATE TABLE IF NOT EXISTS force_majeure_cases (
+    case_id TEXT PRIMARY KEY,
+    route_id TEXT NOT NULL REFERENCES routes(route_id),
+    state TEXT NOT NULL DEFAULT 'open' CHECK(state IN ('open','revoked')),
+    opened_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    opened_at TEXT NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS force_majeure_versions (
+    version_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_id TEXT NOT NULL REFERENCES force_majeure_cases(case_id),
+    version_no INTEGER NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('declare','extend','end_early','amend','revoke')),
+    evidence_json TEXT NOT NULL,
+    evidence_sha256 TEXT NOT NULL,
+    starts_at TEXT NOT NULL,
+    ends_at TEXT NOT NULL,
+    capacity_percent TEXT NOT NULL,
+    appeal_deadline TEXT NOT NULL,
+    supersedes_version_id INTEGER REFERENCES force_majeure_versions(version_id),
+    frozen_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    frozen_at TEXT NOT NULL,
+    UNIQUE(case_id, version_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fm_versions_case
+ON force_majeure_versions(case_id, version_no);
+
+CREATE TABLE IF NOT EXISTS force_majeure_runs (
+    run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_id TEXT NOT NULL REFERENCES force_majeure_cases(case_id),
+    version_id INTEGER NOT NULL REFERENCES force_majeure_versions(version_id),
+    input_sha256 TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL,
+    UNIQUE(version_id)
+);
+
+CREATE TABLE IF NOT EXISTS force_majeure_curtailments (
+    item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL REFERENCES force_majeure_runs(run_id),
+    case_id TEXT NOT NULL REFERENCES force_majeure_cases(case_id),
+    nomination_id TEXT NOT NULL REFERENCES nominations(nomination_id),
+    service_date TEXT NOT NULL,
+    allocated_before TEXT NOT NULL,
+    allocated_after TEXT NOT NULL,
+    released_barrels TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_fm_curtailments_nomination
+ON force_majeure_curtailments(case_id, nomination_id, item_id);
+
+CREATE TABLE IF NOT EXISTS force_majeure_appeals (
+    appeal_id TEXT PRIMARY KEY,
+    case_id TEXT NOT NULL REFERENCES force_majeure_cases(case_id),
+    nomination_id TEXT NOT NULL REFERENCES nominations(nomination_id),
+    shipper_id TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    requested_barrels TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'filed'
+        CHECK(state IN ('filed','upheld','partially_upheld','rejected')),
+    granted_barrels TEXT NOT NULL DEFAULT '0',
+    decision_note TEXT,
+    filed_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    filed_at TEXT NOT NULL,
+    decided_by TEXT REFERENCES supply_users(user_id),
+    decided_at TEXT,
+    UNIQUE(case_id, nomination_id)
+);
+
 CREATE TABLE IF NOT EXISTS supply_idempotency (
     scope TEXT NOT NULL,
     idempotency_key TEXT NOT NULL,

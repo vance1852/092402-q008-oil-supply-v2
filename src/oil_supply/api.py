@@ -77,6 +77,22 @@ class JsonApplication:
                 return Response(200, self.service.allocate(actor, parts[1], payload["service_date"]))
             if method == "POST" and path == "/transfers":
                 return Response(201, self.service.dispatch_transfer(actor, payload["transfer_id"], payload["nomination_id"], payload["lot_id"], int(payload["expected_revision"])))
+            if method == "POST" and path == "/inventory/reservations":
+                return Response(201, self.service.reserve_inventory(actor, payload))
+            if method == "POST" and path == "/force-majeure":
+                return Response(201, self.service.declare_force_majeure(actor, payload))
+            if method == "POST" and len(parts) == 3 and parts[0] == "force-majeure" and parts[2] == "versions":
+                return Response(201, self.service.revise_force_majeure(actor, parts[1], payload))
+            if method == "POST" and len(parts) == 3 and parts[0] == "force-majeure" and parts[2] == "apply":
+                return Response(200, self.service.apply_force_majeure(actor, parts[1], int(payload["version_no"])))
+            if method == "GET" and len(parts) == 2 and parts[0] == "force-majeure":
+                return Response(200, self.service.get_force_majeure(actor, parts[1]))
+            if method == "POST" and len(parts) == 3 and parts[0] == "force-majeure" and parts[2] == "appeals":
+                return Response(201, self.service.file_appeal(actor, parts[1], payload))
+            if method == "POST" and len(parts) == 3 and parts[0] == "appeals" and parts[2] == "decide":
+                return Response(200, self.service.decide_appeal(actor, parts[1], payload))
+            if method == "GET" and len(parts) == 3 and parts[0] == "nominations" and parts[2] == "trace":
+                return Response(200, self.service.nomination_trace(actor, parts[1]))
             if method == "POST" and path == "/scenarios":
                 return Response(201, self.service.create_scenario(actor, payload))
             if method == "POST" and len(parts) == 3 and parts[0] == "scenarios" and parts[2] == "approve":

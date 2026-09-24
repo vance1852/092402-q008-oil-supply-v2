@@ -11,7 +11,19 @@ from typing import Any, Iterable, Mapping
 
 from .clock import SystemClock, parse_utc, utc_text
 from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
-from .models import IndexQuote, Facility, InventoryLot, NominationRequest, Route, SupplyScenario
+from .models import (
+    AppealDecision,
+    AppealRequest,
+    ForceMajeureDeclaration,
+    ForceMajeureRevision,
+    IndexQuote,
+    Facility,
+    InventoryLot,
+    NominationRequest,
+    ReservationRequest,
+    Route,
+    SupplyScenario,
+)
 from .planning import (
     AllocationRequest,
     PricePoint,
@@ -30,11 +42,29 @@ from .planning import (
 from .storage import initialize, transaction
 
 
+ZERO = Decimal("0")
+HUNDRED = Decimal("100")
+
 ROLE_PERMISSIONS = {
     "planner": {"quote.write", "catalog.write", "scenario.write", "scenario.run"},
-    "dispatcher": {"nomination.write", "allocation.run", "transfer.write", "inventory.write"},
-    "risk": {"outage.write", "scenario.approve", "report.read"},
-    "auditor": {"report.read", "audit.read"},
+    "dispatcher": {
+        "nomination.write",
+        "allocation.run",
+        "transfer.write",
+        "inventory.write",
+        "appeal.file",
+        "force_majeure.read",
+    },
+    "risk": {
+        "outage.write",
+        "scenario.approve",
+        "report.read",
+        "force_majeure.write",
+        "force_majeure.process",
+        "appeal.decide",
+        "force_majeure.read",
+    },
+    "auditor": {"report.read", "audit.read", "force_majeure.read"},
 }
 
 
@@ -354,6 +384,15 @@ class SupplyService:
             (route["route_id"], end, start),
         ).fetchall()
         percentages = [Decimal(row["capacity_percent"]) for row in rows]
+        fm_rows = self.connection.execute(
+            "SELECT v.capacity_percent FROM force_majeure_versions v "
+            "JOIN force_majeure_cases c ON c.case_id=v.case_id "
+            "WHERE c.route_id=? AND c.state='open' AND v.starts_at<=? AND v.ends_at>=? "
+            "AND v.version_no=(SELECT max(version_no) FROM force_majeure_versions WHERE case_id=c.case_id) "
+            "ORDER BY v.case_id",
+            (route["route_id"], end, start),
+        ).fetchall()
+        percentages += [Decimal(row["capacity_percent"]) for row in fm_rows]
         return effective_capacity(Decimal(route["daily_capacity"]), percentages)
 
     def allocate(self, actor_id: str, route_id: str, service_date: str) -> dict[str, Any]:
@@ -429,14 +468,41 @@ class SupplyService:
         available = Decimal(lot["available_barrels"])
         if lot["facility_id"] != nomination["origin_id"] or lot["product"] != self.route(nomination["route_id"])["product"]:
             raise Conflict("库存批次与线路起点或油品不匹配")
-        if available < allocated:
+        held_rows = self.connection.execute(
+            "SELECT * FROM inventory_reservations WHERE nomination_id=? AND lot_id=? AND state='held' "
+            "ORDER BY reservation_id",
+            (nomination_id, lot_id),
+        ).fetchall()
+        held_total = sum((Decimal(row["held_barrels"]) for row in held_rows), ZERO)
+        remainder = quantize_volume(allocated - min(held_total, allocated))
+        if available < remainder:
             raise Conflict("库存不足以完成分配")
         expected_delivery = delivered_after_loss(allocated, int(nomination["loss_basis_points"]))
         departed_at = self._now()
         with transaction(self.connection, immediate=True):
+            to_consume = min(held_total, allocated)
+            for held_row in held_rows:
+                if to_consume <= ZERO:
+                    break
+                held = Decimal(held_row["held_barrels"])
+                take = min(held, to_consume)
+                to_consume = quantize_volume(to_consume - take)
+                new_held = quantize_volume(held - take)
+                cursor = self.connection.execute(
+                    "UPDATE inventory_reservations SET held_barrels=?,state=?,revision=revision+1 "
+                    "WHERE reservation_id=? AND revision=?",
+                    (
+                        decimal_text(new_held),
+                        "consumed" if new_held == ZERO else "held",
+                        held_row["reservation_id"],
+                        held_row["revision"],
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise Conflict("库存预留已被并发修改")
             self.connection.execute(
                 "UPDATE inventory_lots SET available_barrels=?,revision=revision+1 WHERE lot_id=? AND revision=?",
-                (decimal_text(quantize_volume(available - allocated)), lot_id, lot["revision"]),
+                (decimal_text(quantize_volume(available - remainder)), lot_id, lot["revision"]),
             )
             self.connection.execute(
                 "UPDATE nominations SET state='in_transit',revision=revision+1 WHERE nomination_id=? AND revision=?",
@@ -464,6 +530,758 @@ class SupplyService:
             "expected_delivered_barrels": decimal_text(expected_delivery),
             "expected_arrival": utc_text(parse_utc(departed_at) + timedelta(hours=int(nomination["transit_hours"]))),
         }
+
+    def reserve_inventory(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "inventory.write")
+        request = ReservationRequest.from_dict(raw)
+        nomination = self.connection.execute(
+            "SELECT * FROM nominations WHERE nomination_id=?", (request.nomination_id,)
+        ).fetchone()
+        if nomination is None:
+            raise NotFound("提名不存在")
+        if nomination["state"] != "allocated":
+            raise InvalidState("只有已分配提名可以预留库存")
+        lot = self.connection.execute(
+            "SELECT * FROM inventory_lots WHERE lot_id=?", (request.lot_id,)
+        ).fetchone()
+        if lot is None:
+            raise NotFound("库存批次不存在")
+        route = self.route(nomination["route_id"])
+        if lot["facility_id"] != route["origin_id"] or lot["product"] != route["product"]:
+            raise Conflict("库存批次与线路起点或油品不匹配")
+        quantity = quantize_volume(request.quantity_barrels)
+        held_total = self._held_total(request.nomination_id)
+        if held_total + quantity > Decimal(nomination["allocated_barrels"]):
+            raise Conflict("预留总量超过已分配数量")
+        available = Decimal(lot["available_barrels"])
+        if available < quantity:
+            raise Conflict("库存不足以预留")
+        try:
+            with transaction(self.connection, immediate=True):
+                cursor = self.connection.execute(
+                    "UPDATE inventory_lots SET available_barrels=?,revision=revision+1 WHERE lot_id=? AND revision=?",
+                    (decimal_text(quantize_volume(available - quantity)), request.lot_id, lot["revision"]),
+                )
+                if cursor.rowcount != 1:
+                    raise Conflict("库存批次已被并发修改")
+                self.connection.execute(
+                    "INSERT INTO inventory_reservations(reservation_id,lot_id,nomination_id,quantity_barrels,"
+                    "held_barrels,created_by,created_at) VALUES(?,?,?,?,?,?,?)",
+                    (
+                        request.reservation_id,
+                        request.lot_id,
+                        request.nomination_id,
+                        decimal_text(quantity),
+                        decimal_text(quantity),
+                        actor_id,
+                        self._now(),
+                    ),
+                )
+                self._audit(
+                    "inventory_reservation",
+                    request.reservation_id,
+                    "inventory.reserved",
+                    actor_id,
+                    {
+                        "nomination_id": request.nomination_id,
+                        "lot_id": request.lot_id,
+                        "quantity_barrels": decimal_text(quantity),
+                    },
+                )
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("预留编号已经存在") from exc
+        return {
+            "reservation_id": request.reservation_id,
+            "nomination_id": request.nomination_id,
+            "lot_id": request.lot_id,
+            "held_barrels": decimal_text(quantity),
+            "state": "held",
+        }
+
+    def _held_total(self, nomination_id: str) -> Decimal:
+        rows = self.connection.execute(
+            "SELECT held_barrels FROM inventory_reservations WHERE nomination_id=? AND state='held'",
+            (nomination_id,),
+        ).fetchall()
+        return sum((Decimal(row["held_barrels"]) for row in rows), ZERO)
+
+    def _fm_case(self, case_id: str) -> sqlite3.Row:
+        row = self.connection.execute(
+            "SELECT * FROM force_majeure_cases WHERE case_id=?", (case_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("不可抗力案件不存在")
+        return row
+
+    def _fm_latest_version(self, case_id: str) -> sqlite3.Row:
+        return self.connection.execute(
+            "SELECT * FROM force_majeure_versions WHERE case_id=? ORDER BY version_no DESC LIMIT 1",
+            (case_id,),
+        ).fetchone()
+
+    @staticmethod
+    def _fm_version_dict(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "version_no": row["version_no"],
+            "kind": row["kind"],
+            "starts_at": row["starts_at"],
+            "ends_at": row["ends_at"],
+            "capacity_percent": row["capacity_percent"],
+            "appeal_deadline": row["appeal_deadline"],
+            "evidence": json.loads(row["evidence_json"]),
+            "evidence_sha256": row["evidence_sha256"],
+            "frozen_by": row["frozen_by"],
+            "frozen_at": row["frozen_at"],
+        }
+
+    def _freeze_version(
+        self,
+        case_id: str,
+        kind: str,
+        evidence: Mapping[str, Any],
+        starts_at: str,
+        ends_at: str,
+        capacity_percent: Decimal,
+        appeal_deadline: str,
+        actor_id: str,
+    ) -> tuple[int, int, str]:
+        latest = self._fm_latest_version(case_id)
+        version_no = 1 if latest is None else int(latest["version_no"]) + 1
+        evidence_json = canonical_json(evidence)
+        evidence_sha256 = hashlib.sha256(evidence_json.encode("utf-8")).hexdigest()
+        cursor = self.connection.execute(
+            "INSERT INTO force_majeure_versions(case_id,version_no,kind,evidence_json,evidence_sha256,starts_at,"
+            "ends_at,capacity_percent,appeal_deadline,supersedes_version_id,frozen_by,frozen_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                case_id,
+                version_no,
+                kind,
+                evidence_json,
+                evidence_sha256,
+                starts_at,
+                ends_at,
+                decimal_text(capacity_percent),
+                appeal_deadline,
+                None if latest is None else latest["version_id"],
+                actor_id,
+                self._now(),
+            ),
+        )
+        return int(cursor.lastrowid), version_no, evidence_sha256
+
+    def declare_force_majeure(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "force_majeure.write")
+        declaration = ForceMajeureDeclaration.from_dict(raw)
+        self.route(declaration.route_id)
+        start = parse_utc(declaration.starts_at, "starts_at")
+        end = parse_utc(declaration.ends_at, "ends_at")
+        if end <= start:
+            raise ValidationFailed("ends_at 必须晚于 starts_at")
+        deadline = parse_utc(declaration.appeal_deadline, "appeal_deadline")
+        if deadline <= self.clock.now():
+            raise ValidationFailed("appeal_deadline 必须晚于当前时间")
+        try:
+            with transaction(self.connection, immediate=True):
+                self.connection.execute(
+                    "INSERT INTO force_majeure_cases(case_id,route_id,opened_by,opened_at) VALUES(?,?,?,?)",
+                    (declaration.case_id, declaration.route_id, actor_id, self._now()),
+                )
+                _, version_no, evidence_sha256 = self._freeze_version(
+                    declaration.case_id,
+                    "declare",
+                    declaration.evidence,
+                    utc_text(start),
+                    utc_text(end),
+                    declaration.capacity_percent,
+                    utc_text(deadline),
+                    actor_id,
+                )
+                self._audit(
+                    "force_majeure",
+                    declaration.case_id,
+                    "force_majeure.declared",
+                    actor_id,
+                    {
+                        "route_id": declaration.route_id,
+                        "version_no": version_no,
+                        "evidence_sha256": evidence_sha256,
+                    },
+                )
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("案件编号已经存在") from exc
+        return {
+            "case_id": declaration.case_id,
+            "route_id": declaration.route_id,
+            "state": "open",
+            "version_no": version_no,
+            "evidence_sha256": evidence_sha256,
+        }
+
+    def revise_force_majeure(self, actor_id: str, case_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "force_majeure.write")
+        revision = ForceMajeureRevision.from_dict(raw)
+        with transaction(self.connection, immediate=True):
+            case = self._fm_case(case_id)
+            if case["state"] != "open":
+                raise InvalidState("案件已撤销，不能再冻结新版本")
+            latest = self._fm_latest_version(case_id)
+            latest_starts = parse_utc(latest["starts_at"], "starts_at")
+            latest_ends = parse_utc(latest["ends_at"], "ends_at")
+            starts = latest_starts if revision.starts_at is None else parse_utc(revision.starts_at, "starts_at")
+            ends = latest_ends if revision.ends_at is None else parse_utc(revision.ends_at, "ends_at")
+            capacity = (
+                Decimal(latest["capacity_percent"])
+                if revision.capacity_percent is None
+                else revision.capacity_percent
+            )
+            deadline = revision.appeal_deadline or latest["appeal_deadline"]
+            evidence = revision.evidence if revision.evidence is not None else json.loads(latest["evidence_json"])
+            if revision.kind == "extend":
+                if revision.ends_at is None or ends <= latest_ends:
+                    raise ValidationFailed("延长必须提供更晚的 ends_at")
+                if starts != latest_starts:
+                    raise ValidationFailed("延长不能改变 starts_at")
+            elif revision.kind == "end_early":
+                if revision.ends_at is None or ends >= latest_ends:
+                    raise ValidationFailed("提前结束必须提供更早的 ends_at")
+                if starts != latest_starts:
+                    raise ValidationFailed("提前结束不能改变 starts_at")
+            elif revision.kind == "amend":
+                if starts != latest_starts or ends != latest_ends:
+                    raise ValidationFailed("amend 不改变影响窗口，请使用 extend 或 end_early")
+                if (
+                    revision.capacity_percent is None
+                    and revision.evidence is None
+                    and revision.appeal_deadline is None
+                ):
+                    raise ValidationFailed("amend 必须调整容量上限、证据或申诉截止")
+            elif revision.kind == "revoke":
+                if (
+                    revision.starts_at is not None
+                    or revision.ends_at is not None
+                    or revision.capacity_percent is not None
+                ):
+                    raise ValidationFailed("revoke 不接受窗口或容量参数，容量上限将恢复为 100")
+                capacity = HUNDRED
+            if ends <= starts:
+                raise ValidationFailed("ends_at 必须晚于 starts_at")
+            if revision.appeal_deadline is not None and parse_utc(revision.appeal_deadline, "appeal_deadline") <= self.clock.now():
+                raise ValidationFailed("appeal_deadline 必须晚于当前时间")
+            _, version_no, evidence_sha256 = self._freeze_version(
+                case_id,
+                revision.kind,
+                evidence,
+                utc_text(starts),
+                utc_text(ends),
+                capacity,
+                utc_text(parse_utc(deadline, "appeal_deadline")),
+                actor_id,
+            )
+            if revision.kind == "revoke":
+                self.connection.execute(
+                    "UPDATE force_majeure_cases SET state='revoked',revision=revision+1 WHERE case_id=?",
+                    (case_id,),
+                )
+            self._audit(
+                "force_majeure",
+                case_id,
+                "force_majeure.version_frozen",
+                actor_id,
+                {"version_no": version_no, "kind": revision.kind, "evidence_sha256": evidence_sha256},
+            )
+        return {
+            "case_id": case_id,
+            "version_no": version_no,
+            "kind": revision.kind,
+            "evidence_sha256": evidence_sha256,
+            "state": "revoked" if revision.kind == "revoke" else "open",
+        }
+
+    def _fm_candidates(self, case_id: str, route_id: str) -> list[dict[str, Any]]:
+        """案件的削减候选：当前仍持有配额的提名，以及曾被本案件削减过的提名。"""
+        candidates: dict[str, dict[str, Any]] = {}
+        baseline_rows = self.connection.execute(
+            "SELECT nomination_id,allocated_before FROM force_majeure_curtailments "
+            "WHERE case_id=? AND item_id IN ("
+            "  SELECT min(item_id) FROM force_majeure_curtailments WHERE case_id=? GROUP BY nomination_id"
+            ")",
+            (case_id, case_id),
+        ).fetchall()
+        for row in baseline_rows:
+            nomination = self.connection.execute(
+                "SELECT * FROM nominations WHERE nomination_id=?", (row["nomination_id"],)
+            ).fetchone()
+            if nomination["state"] in ("allocated", "cancelled"):
+                candidates[row["nomination_id"]] = {
+                    "nomination_id": row["nomination_id"],
+                    "service_date": nomination["service_date"],
+                    "priority": int(nomination["priority"]),
+                    "submitted_at": nomination["submitted_at"],
+                    "baseline": Decimal(row["allocated_before"]),
+                    "current": Decimal(nomination["allocated_barrels"]),
+                }
+        allocated_rows = self.connection.execute(
+            "SELECT * FROM nominations WHERE route_id=? AND state='allocated'", (route_id,)
+        ).fetchall()
+        for nomination in allocated_rows:
+            if nomination["nomination_id"] not in candidates:
+                candidates[nomination["nomination_id"]] = {
+                    "nomination_id": nomination["nomination_id"],
+                    "service_date": nomination["service_date"],
+                    "priority": int(nomination["priority"]),
+                    "submitted_at": nomination["submitted_at"],
+                    "baseline": Decimal(nomination["allocated_barrels"]),
+                    "current": Decimal(nomination["allocated_barrels"]),
+                }
+        return sorted(
+            candidates.values(),
+            key=lambda item: (item["service_date"], item["priority"], item["submitted_at"], item["nomination_id"]),
+        )
+
+    def _fm_in_transit(self, route_id: str) -> dict[str, Decimal]:
+        rows = self.connection.execute(
+            "SELECT n.service_date,t.loaded_barrels FROM transfers t "
+            "JOIN nominations n ON n.nomination_id=t.nomination_id "
+            "WHERE n.route_id=? AND t.state='in_transit'",
+            (route_id,),
+        ).fetchall()
+        totals: dict[str, Decimal] = {}
+        for row in rows:
+            totals[row["service_date"]] = totals.get(row["service_date"], ZERO) + Decimal(row["loaded_barrels"])
+        return totals
+
+    def _release_reservations(self, nomination_id: str, amount: Decimal) -> Decimal:
+        """释放提名持有的库存预留并退回批次可用量，返回实际释放数量。必须在事务内调用。"""
+        remaining = quantize_volume(amount)
+        released = ZERO
+        rows = self.connection.execute(
+            "SELECT * FROM inventory_reservations WHERE nomination_id=? AND state='held' ORDER BY reservation_id",
+            (nomination_id,),
+        ).fetchall()
+        for row in rows:
+            if remaining <= ZERO:
+                break
+            held = Decimal(row["held_barrels"])
+            take = min(held, remaining)
+            remaining = quantize_volume(remaining - take)
+            new_held = quantize_volume(held - take)
+            cursor = self.connection.execute(
+                "UPDATE inventory_reservations SET held_barrels=?,state=?,revision=revision+1 "
+                "WHERE reservation_id=? AND revision=?",
+                (
+                    decimal_text(new_held),
+                    "released" if new_held == ZERO else "held",
+                    row["reservation_id"],
+                    row["revision"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise Conflict("库存预留已被并发修改")
+            lot = self.connection.execute(
+                "SELECT * FROM inventory_lots WHERE lot_id=?", (row["lot_id"],)
+            ).fetchone()
+            cursor = self.connection.execute(
+                "UPDATE inventory_lots SET available_barrels=?,revision=revision+1 WHERE lot_id=? AND revision=?",
+                (
+                    decimal_text(quantize_volume(Decimal(lot["available_barrels"]) + take)),
+                    row["lot_id"],
+                    lot["revision"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise Conflict("库存批次已被并发修改")
+            released += take
+        return quantize_volume(released)
+
+    def apply_force_majeure(self, actor_id: str, case_id: str, version_no: int) -> dict[str, Any]:
+        self._require(actor_id, "force_majeure.process")
+        with transaction(self.connection, immediate=True):
+            case = self._fm_case(case_id)
+            version = self.connection.execute(
+                "SELECT * FROM force_majeure_versions WHERE case_id=? AND version_no=?",
+                (case_id, version_no),
+            ).fetchone()
+            if version is None:
+                raise NotFound("案件版本不存在")
+            latest = self._fm_latest_version(case_id)
+            if int(latest["version_no"]) != int(version_no):
+                raise InvalidState("只能应用案件的最新版本")
+            existing = self.connection.execute(
+                "SELECT run_id,result_json FROM force_majeure_runs WHERE version_id=?",
+                (version["version_id"],),
+            ).fetchone()
+            if existing is not None:
+                return {"run_id": existing["run_id"], **json.loads(existing["result_json"]), "replayed": True}
+            route = self.connection.execute(
+                "SELECT * FROM routes WHERE route_id=?", (case["route_id"],)
+            ).fetchone()
+            candidates = self._fm_candidates(case_id, route["route_id"])
+            start_date = version["starts_at"][:10]
+            end_date = version["ends_at"][:10]
+            in_transit = self._fm_in_transit(route["route_id"])
+            plan: list[dict[str, Any]] = []
+            dates: dict[str, dict[str, Any]] = {}
+            for service_date in sorted({item["service_date"] for item in candidates}):
+                in_window = start_date <= service_date <= end_date
+                group = [item for item in candidates if item["service_date"] == service_date]
+                if in_window:
+                    ceiling: Decimal | None = self._capacity_for_date(route, service_date)
+                    targets = {
+                        row["nomination_id"]: Decimal(row["allocated_barrels"])
+                        for row in allocate_capacity(
+                            ceiling,
+                            [
+                                AllocationRequest(
+                                    item["nomination_id"], item["baseline"], item["priority"], item["submitted_at"]
+                                )
+                                for item in group
+                            ],
+                        )
+                    }
+                else:
+                    ceiling = None
+                    targets = {item["nomination_id"]: item["baseline"] for item in group}
+                before_total = sum((item["current"] for item in group), ZERO)
+                after_total = sum(targets.values(), ZERO)
+                curtailed = ZERO
+                restored = ZERO
+                for item in group:
+                    target = quantize_volume(targets[item["nomination_id"]])
+                    delta = target - item["current"]
+                    if delta < ZERO:
+                        curtailed += -delta
+                    elif delta > ZERO:
+                        restored += delta
+                    plan.append({**item, "target": target})
+                dates[service_date] = {
+                    "service_date": service_date,
+                    "in_window": in_window,
+                    "ceiling": None if ceiling is None else decimal_text(ceiling),
+                    "allocated_before": decimal_text(quantize_volume(before_total)),
+                    "allocated_after": decimal_text(quantize_volume(after_total)),
+                    "curtailed": decimal_text(quantize_volume(curtailed)),
+                    "restored": decimal_text(quantize_volume(restored)),
+                    "in_transit": decimal_text(quantize_volume(in_transit.get(service_date, ZERO))),
+                }
+            items: list[dict[str, Any]] = []
+            released_by_date: dict[str, Decimal] = {}
+            for entry in plan:
+                target = entry["target"]
+                current = entry["current"]
+                if target == current:
+                    continue
+                released = ZERO
+                if target < current:
+                    released = self._release_reservations(entry["nomination_id"], current - target)
+                self.connection.execute(
+                    "UPDATE nominations SET allocated_barrels=?,state=?,revision=revision+1 WHERE nomination_id=?",
+                    (decimal_text(target), "cancelled" if target == ZERO else "allocated", entry["nomination_id"]),
+                )
+                items.append({
+                    "nomination_id": entry["nomination_id"],
+                    "service_date": entry["service_date"],
+                    "allocated_before": decimal_text(quantize_volume(current)),
+                    "allocated_after": decimal_text(target),
+                    "released_barrels": decimal_text(released),
+                })
+                released_by_date[entry["service_date"]] = released_by_date.get(entry["service_date"], ZERO) + released
+            totals = {"before": ZERO, "after": ZERO, "curtailed": ZERO, "restored": ZERO, "released": ZERO, "transit": ZERO}
+            date_rows = []
+            for service_date in sorted(dates):
+                row = dates[service_date]
+                released = released_by_date.get(service_date, ZERO)
+                row["released_inventory"] = decimal_text(quantize_volume(released))
+                date_rows.append(row)
+                totals["before"] += Decimal(row["allocated_before"])
+                totals["after"] += Decimal(row["allocated_after"])
+                totals["curtailed"] += Decimal(row["curtailed"])
+                totals["restored"] += Decimal(row["restored"])
+                totals["released"] += released
+                totals["transit"] += Decimal(row["in_transit"])
+            result = {
+                "case_id": case_id,
+                "version_no": int(version_no),
+                "dates": date_rows,
+                "totals": {
+                    "allocated_before": decimal_text(quantize_volume(totals["before"])),
+                    "allocated_after": decimal_text(quantize_volume(totals["after"])),
+                    "curtailed": decimal_text(quantize_volume(totals["curtailed"])),
+                    "restored": decimal_text(quantize_volume(totals["restored"])),
+                    "released_inventory": decimal_text(quantize_volume(totals["released"])),
+                    "in_transit": decimal_text(quantize_volume(totals["transit"])),
+                },
+                "items": items,
+            }
+            input_sha256 = digest({
+                "case_id": case_id,
+                "version_id": version["version_id"],
+                "candidates": [
+                    {key: (decimal_text(value) if isinstance(value, Decimal) else value) for key, value in entry.items()}
+                    for entry in plan
+                ],
+            })
+            cursor = self.connection.execute(
+                "INSERT INTO force_majeure_runs(case_id,version_id,input_sha256,result_json,created_by,created_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (case_id, version["version_id"], input_sha256, canonical_json(result), actor_id, self._now()),
+            )
+            run_id = int(cursor.lastrowid)
+            for item in items:
+                self.connection.execute(
+                    "INSERT INTO force_majeure_curtailments(run_id,case_id,nomination_id,service_date,"
+                    "allocated_before,allocated_after,released_barrels,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        run_id,
+                        case_id,
+                        item["nomination_id"],
+                        item["service_date"],
+                        item["allocated_before"],
+                        item["allocated_after"],
+                        item["released_barrels"],
+                        self._now(),
+                    ),
+                )
+            self._audit(
+                "force_majeure",
+                case_id,
+                "force_majeure.applied",
+                actor_id,
+                {
+                    "run_id": run_id,
+                    "version_no": int(version_no),
+                    "curtailed": result["totals"]["curtailed"],
+                    "restored": result["totals"]["restored"],
+                    "released_inventory": result["totals"]["released_inventory"],
+                },
+            )
+            return {"run_id": run_id, **result, "replayed": False}
+
+    def file_appeal(self, actor_id: str, case_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "appeal.file")
+        appeal = AppealRequest.from_dict(raw)
+        case = self._fm_case(case_id)
+        if case["state"] != "open":
+            raise InvalidState("案件已撤销，不能申诉")
+        nomination = self.connection.execute(
+            "SELECT * FROM nominations WHERE nomination_id=?", (appeal.nomination_id,)
+        ).fetchone()
+        if nomination is None:
+            raise NotFound("提名不存在")
+        if nomination["route_id"] != case["route_id"]:
+            raise ValidationFailed("提名不属于案件线路")
+        items = self.connection.execute(
+            "SELECT allocated_before,allocated_after FROM force_majeure_curtailments "
+            "WHERE case_id=? AND nomination_id=?",
+            (case_id, appeal.nomination_id),
+        ).fetchall()
+        if not any(Decimal(row["allocated_after"]) < Decimal(row["allocated_before"]) for row in items):
+            raise InvalidState("提名未被该案件削减，不能申诉")
+        latest = self._fm_latest_version(case_id)
+        if parse_utc(latest["appeal_deadline"], "appeal_deadline") < self.clock.now():
+            raise InvalidState("申诉截止已过")
+        try:
+            with transaction(self.connection, immediate=True):
+                self.connection.execute(
+                    "INSERT INTO force_majeure_appeals(appeal_id,case_id,nomination_id,shipper_id,reason,"
+                    "requested_barrels,filed_by,filed_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        appeal.appeal_id,
+                        case_id,
+                        appeal.nomination_id,
+                        nomination["shipper_id"],
+                        appeal.reason,
+                        decimal_text(quantize_volume(appeal.requested_barrels)),
+                        actor_id,
+                        self._now(),
+                    ),
+                )
+                self._audit(
+                    "appeal",
+                    appeal.appeal_id,
+                    "appeal.filed",
+                    actor_id,
+                    {"case_id": case_id, "nomination_id": appeal.nomination_id},
+                )
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("该提名已提交过申诉") from exc
+        return {
+            "appeal_id": appeal.appeal_id,
+            "case_id": case_id,
+            "nomination_id": appeal.nomination_id,
+            "state": "filed",
+        }
+
+    def decide_appeal(self, actor_id: str, appeal_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "appeal.decide")
+        decision = AppealDecision.from_dict(raw)
+        with transaction(self.connection, immediate=True):
+            appeal = self.connection.execute(
+                "SELECT * FROM force_majeure_appeals WHERE appeal_id=?", (appeal_id,)
+            ).fetchone()
+            if appeal is None:
+                raise NotFound("申诉不存在")
+            if appeal["state"] != "filed":
+                raise InvalidState("申诉已处理，不能重复决定")
+            case = self._fm_case(appeal["case_id"])
+            nomination = self.connection.execute(
+                "SELECT * FROM nominations WHERE nomination_id=?", (appeal["nomination_id"],)
+            ).fetchone()
+            route = self.connection.execute(
+                "SELECT * FROM routes WHERE route_id=?", (case["route_id"],)
+            ).fetchone()
+            baseline_row = self.connection.execute(
+                "SELECT allocated_before FROM force_majeure_curtailments WHERE case_id=? AND nomination_id=? "
+                "ORDER BY item_id LIMIT 1",
+                (appeal["case_id"], appeal["nomination_id"]),
+            ).fetchone()
+            baseline = Decimal(baseline_row["allocated_before"])
+            current = Decimal(nomination["allocated_barrels"])
+            deficit = max(ZERO, baseline - current)
+            ceiling = self._capacity_for_date(route, nomination["service_date"])
+            peers = self.connection.execute(
+                "SELECT allocated_barrels FROM nominations WHERE route_id=? AND service_date=? AND state='allocated'",
+                (case["route_id"], nomination["service_date"]),
+            ).fetchall()
+            total_allocated = sum((Decimal(row["allocated_barrels"]) for row in peers), ZERO)
+            headroom = max(ZERO, ceiling - total_allocated)
+            requested = Decimal(appeal["requested_barrels"])
+            if decision.decision == "rejected":
+                granted = ZERO
+            elif decision.decision == "upheld":
+                granted = min(requested, deficit, headroom)
+            else:
+                granted = min(decision.granted_barrels, requested, deficit, headroom)
+            granted = quantize_volume(granted)
+            cursor = self.connection.execute(
+                "UPDATE force_majeure_appeals SET state=?,granted_barrels=?,decision_note=?,decided_by=?,decided_at=? "
+                "WHERE appeal_id=? AND state='filed'",
+                (decision.decision, decimal_text(granted), decision.note, actor_id, self._now(), appeal_id),
+            )
+            if cursor.rowcount != 1:
+                raise InvalidState("申诉已处理，不能重复决定")
+            if granted > ZERO:
+                self.connection.execute(
+                    "UPDATE nominations SET allocated_barrels=?,state='allocated',revision=revision+1 "
+                    "WHERE nomination_id=?",
+                    (decimal_text(quantize_volume(current + granted)), appeal["nomination_id"]),
+                )
+            self._audit(
+                "appeal",
+                appeal_id,
+                "appeal.decided",
+                actor_id,
+                {
+                    "case_id": appeal["case_id"],
+                    "nomination_id": appeal["nomination_id"],
+                    "decision": decision.decision,
+                    "granted_barrels": decimal_text(granted),
+                },
+            )
+        return {
+            "appeal_id": appeal_id,
+            "state": decision.decision,
+            "granted_barrels": decimal_text(granted),
+            "remaining_deficit": decimal_text(quantize_volume(deficit - granted)),
+            "headroom_barrels": decimal_text(quantize_volume(headroom - granted)),
+        }
+
+    def get_force_majeure(self, actor_id: str, case_id: str) -> dict[str, Any]:
+        self._require(actor_id, "force_majeure.read")
+        case = self._fm_case(case_id)
+        versions = self.connection.execute(
+            "SELECT * FROM force_majeure_versions WHERE case_id=? ORDER BY version_no", (case_id,)
+        ).fetchall()
+        runs = self.connection.execute(
+            "SELECT r.*,v.version_no FROM force_majeure_runs r "
+            "JOIN force_majeure_versions v ON v.version_id=r.version_id "
+            "WHERE r.case_id=? ORDER BY r.run_id",
+            (case_id,),
+        ).fetchall()
+        applied = {row["version_no"] for row in runs}
+        appeals = self.connection.execute(
+            "SELECT * FROM force_majeure_appeals WHERE case_id=? ORDER BY filed_at,appeal_id", (case_id,)
+        ).fetchall()
+        return {
+            "case_id": case_id,
+            "route_id": case["route_id"],
+            "state": case["state"],
+            "opened_by": case["opened_by"],
+            "opened_at": case["opened_at"],
+            "versions": [
+                {**self._fm_version_dict(row), "applied": row["version_no"] in applied}
+                for row in versions
+            ],
+            "runs": [
+                {
+                    "run_id": row["run_id"],
+                    "version_no": row["version_no"],
+                    "applied_by": row["created_by"],
+                    "applied_at": row["created_at"],
+                    **json.loads(row["result_json"]),
+                }
+                for row in runs
+            ],
+            "appeals": [dict(row) for row in appeals],
+        }
+
+    def nomination_trace(self, actor_id: str, nomination_id: str) -> dict[str, Any]:
+        self._require(actor_id, "force_majeure.read")
+        nomination = self.connection.execute(
+            "SELECT * FROM nominations WHERE nomination_id=?", (nomination_id,)
+        ).fetchone()
+        if nomination is None:
+            raise NotFound("提名不存在")
+        case_rows = self.connection.execute(
+            "SELECT DISTINCT case_id FROM force_majeure_curtailments WHERE nomination_id=? ORDER BY case_id",
+            (nomination_id,),
+        ).fetchall()
+        cases = []
+        for case_row in case_rows:
+            case_id = case_row["case_id"]
+            case = self._fm_case(case_id)
+            items = self.connection.execute(
+                "SELECT c.*,v.version_no,r.created_at AS applied_at FROM force_majeure_curtailments c "
+                "JOIN force_majeure_runs r ON r.run_id=c.run_id "
+                "JOIN force_majeure_versions v ON v.version_id=r.version_id "
+                "WHERE c.case_id=? AND c.nomination_id=? ORDER BY c.item_id",
+                (case_id, nomination_id),
+            ).fetchall()
+            curtailments = []
+            restorations = []
+            for item in items:
+                entry = {
+                    "version_no": item["version_no"],
+                    "allocated_before": item["allocated_before"],
+                    "allocated_after": item["allocated_after"],
+                    "released_barrels": item["released_barrels"],
+                    "applied_at": item["applied_at"],
+                }
+                if Decimal(item["allocated_after"]) < Decimal(item["allocated_before"]):
+                    curtailments.append(entry)
+                elif Decimal(item["allocated_after"]) > Decimal(item["allocated_before"]):
+                    restorations.append(entry)
+            appeal = self.connection.execute(
+                "SELECT * FROM force_majeure_appeals WHERE case_id=? AND nomination_id=?",
+                (case_id, nomination_id),
+            ).fetchone()
+            order_rows = self.connection.execute(
+                "SELECT nomination_id,shipper_id,priority,submitted_at,allocated_barrels,state FROM nominations "
+                "WHERE route_id=? AND service_date=? ORDER BY priority,submitted_at,nomination_id",
+                (case["route_id"], nomination["service_date"]),
+            ).fetchall()
+            cases.append({
+                "case_id": case_id,
+                "case_state": case["state"],
+                "latest_version": self._fm_version_dict(self._fm_latest_version(case_id)),
+                "contract_order": [
+                    {"position": index + 1, **dict(row)} for index, row in enumerate(order_rows)
+                ],
+                "curtailments": curtailments,
+                "restorations": restorations,
+                "appeal": None if appeal is None else dict(appeal),
+            })
+        return {"nomination": dict(nomination), "force_majeure": cases}
 
     def create_scenario(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
         self._require(actor_id, "scenario.write")

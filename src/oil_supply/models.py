@@ -10,6 +10,7 @@ from typing import Any, Mapping
 
 from .clock import parse_utc
 from .errors import ValidationFailed
+from .planning import canonical_json
 
 
 IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{1,63}$")
@@ -260,3 +261,148 @@ class SupplyScenario:
             route_capacity_changes=parsed_routes,
             demand_changes=parsed_demand,
         )
+
+
+REVISION_KINDS = {"extend", "end_early", "amend", "revoke"}
+APPEAL_DECISIONS = {"upheld", "partially_upheld", "rejected"}
+
+
+def _utc_text_field(value: object, field: str) -> str:
+    result = required_text(value, field, 40)
+    try:
+        parse_utc(result, field)
+    except ValueError as exc:
+        raise ValidationFailed(str(exc)) from exc
+    return result
+
+
+def _evidence_field(value: object) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping) or not value:
+        raise ValidationFailed("evidence 必须是非空 JSON 对象")
+    try:
+        canonical_json(value)
+    except (TypeError, ValueError) as exc:
+        raise ValidationFailed("evidence 必须可以序列化为 JSON") from exc
+    return value
+
+
+def _capacity_percent_field(value: object) -> Decimal:
+    return decimal_value(
+        value, "capacity_percent", minimum=Decimal("0"), maximum=Decimal("100")
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ForceMajeureDeclaration:
+    case_id: str
+    route_id: str
+    evidence: Mapping[str, Any]
+    starts_at: str
+    ends_at: str
+    capacity_percent: Decimal
+    appeal_deadline: str
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "ForceMajeureDeclaration":
+        return cls(
+            case_id=identifier(raw.get("case_id"), "case_id"),
+            route_id=identifier(raw.get("route_id"), "route_id"),
+            evidence=_evidence_field(raw.get("evidence")),
+            starts_at=_utc_text_field(raw.get("starts_at"), "starts_at"),
+            ends_at=_utc_text_field(raw.get("ends_at"), "ends_at"),
+            capacity_percent=_capacity_percent_field(raw.get("capacity_percent")),
+            appeal_deadline=_utc_text_field(raw.get("appeal_deadline"), "appeal_deadline"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ForceMajeureRevision:
+    kind: str
+    evidence: Mapping[str, Any] | None
+    starts_at: str | None
+    ends_at: str | None
+    capacity_percent: Decimal | None
+    appeal_deadline: str | None
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "ForceMajeureRevision":
+        kind = required_text(raw.get("kind"), "kind", 16)
+        if kind not in REVISION_KINDS:
+            raise ValidationFailed("kind 必须是 extend、end_early、amend 或 revoke")
+        evidence = raw.get("evidence")
+        capacity = raw.get("capacity_percent")
+        return cls(
+            kind=kind,
+            evidence=None if evidence is None else _evidence_field(evidence),
+            starts_at=(
+                None if raw.get("starts_at") is None else _utc_text_field(raw.get("starts_at"), "starts_at")
+            ),
+            ends_at=(
+                None if raw.get("ends_at") is None else _utc_text_field(raw.get("ends_at"), "ends_at")
+            ),
+            capacity_percent=None if capacity is None else _capacity_percent_field(capacity),
+            appeal_deadline=(
+                None
+                if raw.get("appeal_deadline") is None
+                else _utc_text_field(raw.get("appeal_deadline"), "appeal_deadline")
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ReservationRequest:
+    reservation_id: str
+    lot_id: str
+    nomination_id: str
+    quantity_barrels: Decimal
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "ReservationRequest":
+        return cls(
+            reservation_id=identifier(raw.get("reservation_id"), "reservation_id"),
+            lot_id=identifier(raw.get("lot_id"), "lot_id"),
+            nomination_id=identifier(raw.get("nomination_id"), "nomination_id"),
+            quantity_barrels=decimal_value(
+                raw.get("quantity_barrels"), "quantity_barrels", minimum=Decimal("0.001")
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class AppealRequest:
+    appeal_id: str
+    nomination_id: str
+    reason: str
+    requested_barrels: Decimal
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "AppealRequest":
+        return cls(
+            appeal_id=identifier(raw.get("appeal_id"), "appeal_id"),
+            nomination_id=identifier(raw.get("nomination_id"), "nomination_id"),
+            reason=required_text(raw.get("reason"), "reason", 512),
+            requested_barrels=decimal_value(
+                raw.get("requested_barrels"), "requested_barrels", minimum=Decimal("0.001")
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class AppealDecision:
+    decision: str
+    granted_barrels: Decimal | None
+    note: str
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "AppealDecision":
+        decision = required_text(raw.get("decision"), "decision", 24)
+        if decision not in APPEAL_DECISIONS:
+            raise ValidationFailed("decision 必须是 upheld、partially_upheld 或 rejected")
+        granted = raw.get("granted_barrels")
+        parsed = None if granted is None else decimal_value(
+            granted, "granted_barrels", minimum=Decimal("0.001")
+        )
+        if decision == "partially_upheld" and parsed is None:
+            raise ValidationFailed("部分核准必须提供 granted_barrels")
+        note = raw.get("note", "")
+        return cls(decision=decision, granted_barrels=parsed, note=required_text(note, "note", 512) if note else "")
